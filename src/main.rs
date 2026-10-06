@@ -50,12 +50,31 @@ struct Window {
     formatted_message: String,
 }
 
-type Raw = HashMap<String, HashMap<String, Window>>;
+/// One provider as it arrives on the wire: an optional `updated_at` plus any number of
+/// other keys. Keys whose value is a JSON object are windows; scalar keys are metadata
+/// we don't know about and ignore (the backend has already added one such key once).
+#[derive(Debug, Deserialize)]
+struct ProviderRaw {
+    updated_at: Option<i64>,
+    #[serde(flatten)]
+    rest: HashMap<String, serde_json::Value>,
+}
 
-/// Providers sorted by name; windows sorted with `five_hours`, `seven_days` first.
+type Raw = HashMap<String, ProviderRaw>;
+
+#[derive(Debug, Clone, PartialEq)]
+struct Provider {
+    name: String,
+    /// Millisecond epoch of when the backend last refreshed this provider's numbers.
+    updated_at: Option<i64>,
+    /// Sorted with `five_hours`, `seven_days` first, then alphabetically.
+    windows: Vec<(String, Window)>,
+}
+
+/// Providers sorted by name.
 #[derive(Debug, Clone, PartialEq)]
 struct Usage {
-    providers: Vec<(String, Vec<(String, Window)>)>,
+    providers: Vec<Provider>,
 }
 
 fn window_rank(name: &str) -> (u8, &str) {
@@ -69,25 +88,34 @@ fn window_rank(name: &str) -> (u8, &str) {
 #[cfg(test)]
 fn parse_usage(json: &str) -> Result<Usage, serde_json::Error> {
     let raw: Raw = serde_json::from_str(json)?;
-    Ok(Usage::from_raw(raw))
+    Usage::from_raw(raw)
 }
 
 impl Usage {
-    fn from_raw(raw: Raw) -> Self {
-        let mut providers: Vec<(String, Vec<(String, Window)>)> = raw
+    fn from_raw(raw: Raw) -> Result<Self, serde_json::Error> {
+        let mut providers = raw
             .into_iter()
-            .map(|(provider, windows)| {
-                let mut windows: Vec<(String, Window)> = windows.into_iter().collect();
+            .map(|(name, p)| {
+                let mut windows = p
+                    .rest
+                    .into_iter()
+                    .filter(|(_, v)| v.is_object())
+                    .map(|(k, v)| serde_json::from_value::<Window>(v).map(|w| (k, w)))
+                    .collect::<Result<Vec<_>, _>>()?;
                 windows.sort_by(|(a, _), (b, _)| window_rank(a).cmp(&window_rank(b)));
-                (provider, windows)
+                Ok(Provider {
+                    name,
+                    updated_at: p.updated_at,
+                    windows,
+                })
             })
-            .collect();
-        providers.sort_by(|(a, _), (b, _)| a.cmp(b));
-        Usage { providers }
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+        providers.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Usage { providers })
     }
 
     fn window_count(&self) -> usize {
-        self.providers.iter().map(|(_, w)| w.len()).sum()
+        self.providers.iter().map(|p| p.windows.len()).sum()
     }
 }
 
@@ -125,6 +153,17 @@ fn format_reset(resets_at_ms: i64, now: DateTime<Local>) -> String {
     }
 }
 
+/// Server-side refresh time of a provider, in local time with the date (it may not be today).
+fn format_updated_at(updated_at_ms: i64) -> String {
+    match DateTime::from_timestamp_millis(updated_at_ms) {
+        Some(utc) => utc
+            .with_timezone(&Local)
+            .format("%m-%d %H:%M:%S")
+            .to_string(),
+        None => format!("updated_at={updated_at_ms} (invalid)"),
+    }
+}
+
 fn window_label(w: &Window, now: DateTime<Local>) -> String {
     format!(
         "{}% left | {} | {}",
@@ -141,9 +180,12 @@ fn plain_bar(used: u8) -> String {
 
 fn render_plain(usage: &Usage, now: DateTime<Local>) -> String {
     let mut out = String::new();
-    for (provider, windows) in &usage.providers {
-        out.push_str(&format!("[{provider}]\n"));
-        for (name, w) in windows {
+    for p in &usage.providers {
+        match p.updated_at {
+            Some(ts) => out.push_str(&format!("[{}] updated {}\n", p.name, format_updated_at(ts))),
+            None => out.push_str(&format!("[{}]\n", p.name)),
+        }
+        for (name, w) in &p.windows {
             out.push_str(&format!(
                 "  {name:<12} {} {}\n",
                 plain_bar(w.used),
@@ -180,7 +222,7 @@ fn fetch_usage(agent: &ureq::Agent, url: &str) -> Result<Usage, String> {
         .body_mut()
         .read_json()
         .map_err(|e| format!("invalid response body: {e}"))?;
-    Ok(Usage::from_raw(raw))
+    Usage::from_raw(raw).map_err(|e| format!("invalid response body: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -226,11 +268,18 @@ fn render(frame: &mut Frame, app: &App, now: DateTime<Local>) {
         None => frame.render_widget(Paragraph::new("Waiting for first fetch..."), body),
     }
 
+    let fetched = app
+        .last_updated
+        .map(|t| t.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "never".to_string());
     let footer_text = match &app.last_error {
-        Some(e) => Line::styled(format!("ERROR: {e}  (q / Esc / Ctrl-C to quit)"), Color::Red),
+        Some(e) => Line::styled(
+            format!("fetched {fetched}  |  ERROR: {e}  (q / Esc / Ctrl-C to quit)"),
+            Color::Red,
+        ),
         None => Line::styled(
             format!(
-                "refresh every {}s  |  q / Esc / Ctrl-C to quit",
+                "fetched {fetched}  |  refresh every {}s  |  q / Esc / Ctrl-C to quit",
                 app.interval.as_secs()
             ),
             Color::DarkGray,
@@ -240,28 +289,31 @@ fn render(frame: &mut Frame, app: &App, now: DateTime<Local>) {
 }
 
 fn render_usage(frame: &mut Frame, area: Rect, usage: &Usage, app: &App, now: DateTime<Local>) {
-    let updated = app
+    // Fallback title time when the backend doesn't say when its numbers were refreshed.
+    let fetched = app
         .last_updated
-        .map(|t| t.format("%H:%M:%S").to_string())
+        .map(|t| t.format("%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| "never".to_string());
 
     // One block per provider; each window is a 3-row gauge inside.
     let provider_heights: Vec<Constraint> = usage
         .providers
         .iter()
-        .map(|(_, w)| Constraint::Length(u16::try_from(w.len() * 3 + 2).unwrap_or(u16::MAX)))
+        .map(|p| Constraint::Length(u16::try_from(p.windows.len() * 3 + 2).unwrap_or(u16::MAX)))
         .collect();
     let provider_areas = Layout::vertical(provider_heights).split(area);
 
-    for ((provider, windows), provider_area) in usage.providers.iter().zip(provider_areas.iter()) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {provider} — updated {updated} "));
+    for (p, provider_area) in usage.providers.iter().zip(provider_areas.iter()) {
+        let title = match p.updated_at {
+            Some(ts) => format!(" {} — updated {} ", p.name, format_updated_at(ts)),
+            None => format!(" {} — fetched {fetched} ", p.name),
+        };
+        let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(*provider_area);
         frame.render_widget(block, *provider_area);
 
-        let rows = Layout::vertical(windows.iter().map(|_| Constraint::Length(3))).split(inner);
-        for ((name, w), row) in windows.iter().zip(rows.iter()) {
+        let rows = Layout::vertical(p.windows.iter().map(|_| Constraint::Length(3))).split(inner);
+        for ((name, w), row) in p.windows.iter().zip(rows.iter()) {
             let used = w.used.min(100);
             let color = match used {
                 0..=59 => Color::Green,
@@ -374,22 +426,81 @@ mod tests {
       }
     }"#;
 
+    /// Exact payload the backend sends since 2026-10-06: `updated_at` sits next to the windows.
+    const SAMPLE_WITH_UPDATED_AT: &str = r#"{
+      "claude": {
+        "five_hours": { "used": 1, "resets_at": 1791283199962, "formatted_message": "*99%* remaining, resets 10-06 18:39" },
+        "seven_days": { "used": 4, "resets_at": 1791845999962, "formatted_message": "*96%* remaining, resets 10-13 06:59" },
+        "updated_at": 1791268244117
+      }
+    }"#;
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    fn window_names(p: &Provider) -> Vec<&str> {
+        p.windows.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
     #[test]
     fn parses_and_sorts() {
         let usage = parse_usage(SAMPLE).expect("parse");
-        let providers: Vec<&str> = usage.providers.iter().map(|(p, _)| p.as_str()).collect();
+        let providers: Vec<&str> = usage.providers.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(providers, ["bard", "claude", "openai"]);
 
-        let claude: Vec<&str> = usage.providers[1].1.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(claude, ["five_hours", "seven_days", "one_day"]);
+        assert_eq!(
+            window_names(&usage.providers[1]),
+            ["five_hours", "seven_days", "one_day"]
+        );
+        assert_eq!(window_names(&usage.providers[0]), ["alpha", "zeta"]);
 
-        let bard: Vec<&str> = usage.providers[0].1.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(bard, ["alpha", "zeta"]);
-
-        let five = &usage.providers[1].1[0].1;
+        let five = &usage.providers[1].windows[0].1;
         assert_eq!(five.used, 23);
         assert_eq!(five.resets_at, 1791196799681);
         assert_eq!(remaining_percent(five), 77);
+
+        // Old format: no provider-level updated_at.
+        assert!(usage.providers.iter().all(|p| p.updated_at.is_none()));
+    }
+
+    #[test]
+    fn parses_provider_level_updated_at() {
+        let usage = parse_usage(SAMPLE_WITH_UPDATED_AT).expect("parse");
+        assert_eq!(usage.providers.len(), 1);
+        let claude = &usage.providers[0];
+        assert_eq!(claude.name, "claude");
+        assert_eq!(claude.updated_at, Some(1791268244117));
+        // updated_at must not leak in as a window.
+        assert_eq!(window_names(claude), ["five_hours", "seven_days"]);
+        assert_eq!(claude.windows[0].1.used, 1);
+        assert_eq!(claude.windows[1].1.used, 4);
+    }
+
+    #[test]
+    fn ignores_unknown_scalar_metadata_but_rejects_bad_windows() {
+        let ok = r#"{"claude":{"plan":"pro","count":3,"five_hours":{"used":9,"resets_at":1,"formatted_message":"m"}}}"#;
+        let usage = parse_usage(ok).expect("parse");
+        assert_eq!(window_names(&usage.providers[0]), ["five_hours"]);
+
+        // An object that is not a window is a format drift we want to see, not hide.
+        let bad = r#"{"claude":{"five_hours":{"used":9,"resets_at":1,"formatted_message":"m"},"meta":{"x":1}}}"#;
+        assert!(parse_usage(bad).is_err());
+    }
+
+    #[test]
+    fn updated_at_uses_millis() {
+        // 2026-10-06T06:30:44Z; date must not drift by decades if millis were read as seconds.
+        let s = format_updated_at(1791268244117);
+        assert!(s.starts_with("10-0"), "got {s}");
+        assert!(s.ends_with(":44"), "got {s}");
     }
 
     #[test]
@@ -414,21 +525,46 @@ mod tests {
             .draw(|f| render(f, &app, Local::now()))
             .expect("draw");
 
-        let buf = terminal.backend().buffer();
-        let text: String = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
-                    .collect::<String>()
-                    + "\n"
-            })
-            .collect();
+        let text = buffer_text(terminal.backend().buffer());
 
         assert!(text.contains("77% left"), "missing 77% in:\n{text}");
         assert!(text.contains("85% left"), "missing 85% in:\n{text}");
-        assert!(text.contains("claude"), "missing provider title in:\n{text}");
-        assert!(text.contains("ERROR: boom"), "missing footer error in:\n{text}");
+        assert!(
+            text.contains("claude — fetched"),
+            "missing provider title in:\n{text}"
+        );
+        let footer = format!(
+            "fetched {}  |  ERROR: boom",
+            app.last_updated.expect("fetched").format("%H:%M:%S")
+        );
+        assert!(text.contains(&footer), "missing {footer:?} in:\n{text}");
         assert!(!text.contains('*'), "slack markup not stripped:\n{text}");
+    }
+
+    #[test]
+    fn renders_server_updated_at_in_title_and_fetch_time_in_footer() {
+        let usage = parse_usage(SAMPLE_WITH_UPDATED_AT).expect("parse");
+        let mut app = App::new(Duration::from_secs(60));
+        app.apply(Ok(usage));
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render(f, &app, Local::now()))
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+
+        let expected = format!("claude — updated {}", format_updated_at(1791268244117));
+        assert!(text.contains(&expected), "missing {expected:?} in:\n{text}");
+        let footer = format!(
+            "fetched {}  |  refresh every 60s",
+            app.last_updated.expect("fetched").format("%H:%M:%S")
+        );
+        assert!(text.contains(&footer), "missing {footer:?} in:\n{text}");
+        assert!(
+            text.contains("99% left") && text.contains("96% left"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -438,5 +574,14 @@ mod tests {
         assert!(out.contains('█') && out.contains('░'));
         assert!(out.contains("77% left"));
         assert!(out.contains("85% left"));
+        assert!(
+            out.contains("[claude]\n"),
+            "no updated_at → bare header:\n{out}"
+        );
+
+        let usage = parse_usage(SAMPLE_WITH_UPDATED_AT).expect("parse");
+        let out = render_plain(&usage, Local::now());
+        let expected = format!("[claude] updated {}\n", format_updated_at(1791268244117));
+        assert!(out.contains(&expected), "missing {expected:?} in:\n{out}");
     }
 }

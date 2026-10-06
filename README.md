@@ -30,16 +30,21 @@ ai-usage-tui --once
 ```json
 {
   "claude": {
-    "five_hours": { "used": 23, "resets_at": 1791196799681, "formatted_message": "*77%* remaining, resets 10-05 18:39" },
-    "seven_days": { "used": 15, "resets_at": 1791241199681, "formatted_message": "*85%* remaining, resets 10-06 06:59" }
+    "five_hours": { "used": 1, "resets_at": 1791283199962, "formatted_message": "*99%* remaining, resets 10-06 18:39" },
+    "seven_days": { "used": 4, "resets_at": 1791845999962, "formatted_message": "*96%* remaining, resets 10-13 06:59" },
+    "updated_at": 1791268244117
   }
 }
 ```
 
 - 最外層 key 是 provider，第二層 key 是 window，兩層都可自由增減。
-- `used`：已用百分比（0–100）。`resets_at`：毫秒 epoch。
+- 第二層裡值是物件的 key 才算 window（必須含 `used`、`resets_at`、`formatted_message`，否則整筆回應視為無效）；
+  值不是物件的 key（數字、字串、null、陣列）視為 provider 的 metadata：`updated_at` 會被讀出來顯示，其他一律忽略。
+- `used`：已用百分比（0–100）。`resets_at`、`updated_at`：毫秒 epoch；`updated_at` 可省略。
 - 顯示順序：provider 依字母序；window 先 `five_hours`、`seven_days`，其餘依字母序。
 - `resets_at` 會轉成本地時區顯示，並附倒數（例：`resets 10-05 18:39 (in 2h 13m)`）。
+- `updated_at`（後端上次更新數字的時間）轉成本地時區顯示在 provider 標題（TUI）或 provider 行（`--once`）；
+  沒有時 TUI 標題改顯示本機抓取時間。TUI 底部固定顯示最後一次成功抓取的本機時間（抓取失敗時也會保留）。
 
 ## 開發
 
