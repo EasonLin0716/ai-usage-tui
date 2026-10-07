@@ -46,7 +46,9 @@ struct Cli {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 struct Window {
     used: u8,
-    resets_at: i64,
+    /// Millisecond epoch; the backend sends `null` when the window has no pending reset
+    /// (e.g. nothing has been used yet).
+    resets_at: Option<i64>,
     formatted_message: String,
 }
 
@@ -131,7 +133,10 @@ fn strip_slack_markup(s: &str) -> String {
     s.replace('*', "")
 }
 
-fn format_reset(resets_at_ms: i64, now: DateTime<Local>) -> String {
+fn format_reset(resets_at_ms: Option<i64>, now: DateTime<Local>) -> String {
+    let Some(resets_at_ms) = resets_at_ms else {
+        return "no reset".to_string();
+    };
     match DateTime::from_timestamp_millis(resets_at_ms) {
         Some(utc) => {
             let local = utc.with_timezone(&Local);
@@ -435,6 +440,15 @@ mod tests {
       }
     }"#;
 
+    /// Exact payload seen 2026-10-07: `resets_at` is `null` when nothing has been used in the window.
+    const SAMPLE_WITH_NULL_RESET: &str = r#"{
+      "claude": {
+        "five_hours": { "used": 0, "resets_at": null, "formatted_message": "*100%* remaining" },
+        "seven_days": { "used": 15, "resets_at": 1791846000079, "formatted_message": "*85%* remaining, resets 10-13 07:00" },
+        "updated_at": 1791333570219
+      }
+    }"#;
+
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
         (0..buf.area.height)
             .map(|y| {
@@ -464,7 +478,7 @@ mod tests {
 
         let five = &usage.providers[1].windows[0].1;
         assert_eq!(five.used, 23);
-        assert_eq!(five.resets_at, 1791196799681);
+        assert_eq!(five.resets_at, Some(1791196799681));
         assert_eq!(remaining_percent(five), 77);
 
         // Old format: no provider-level updated_at.
@@ -482,6 +496,23 @@ mod tests {
         assert_eq!(window_names(claude), ["five_hours", "seven_days"]);
         assert_eq!(claude.windows[0].1.used, 1);
         assert_eq!(claude.windows[1].1.used, 4);
+    }
+
+    #[test]
+    fn parses_null_resets_at() {
+        let usage = parse_usage(SAMPLE_WITH_NULL_RESET).expect("parse");
+        let claude = &usage.providers[0];
+        assert_eq!(window_names(claude), ["five_hours", "seven_days"]);
+        let five = &claude.windows[0].1;
+        let seven = &claude.windows[1].1;
+        assert_eq!(five.resets_at, None);
+        assert_eq!(seven.resets_at, Some(1791846000079));
+
+        let now = Local::now();
+        let label = window_label(five, now);
+        assert!(label.ends_with("| no reset"), "got {label}");
+        assert!(!label.contains("invalid"), "got {label}");
+        assert!(window_label(seven, now).contains("resets 10-13"), "got {}", window_label(seven, now));
     }
 
     #[test]
@@ -505,7 +536,7 @@ mod tests {
 
     #[test]
     fn reset_time_uses_millis() {
-        let s = format_reset(1791196799681, Local::now());
+        let s = format_reset(Some(1791196799681), Local::now());
         // 2026-10-05T10:39:59Z; the local hour depends on the machine TZ, the day/month do not
         // drift by a year if millis were mistaken for seconds.
         assert!(s.starts_with("resets 10-0"), "got {s}");
