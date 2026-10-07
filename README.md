@@ -42,7 +42,8 @@ ai-usage-tui --once
   值不是物件的 key（數字、字串、null、陣列）視為 provider 的 metadata：`updated_at` 會被讀出來顯示，其他一律忽略。
 - `used`：已用百分比（0–100）。`resets_at`、`updated_at`：毫秒 epoch；`updated_at` 可省略。
 - 顯示順序：provider 依字母序；window 先 `five_hours`、`seven_days`，其餘依字母序。
-- `resets_at` 會轉成本地時區顯示，並附倒數（例：`resets 10-05 18:39 (in 2h 13m)`）。
+- `resets_at` 會轉成本地時區顯示，並附倒數（例：`resets 10-05 18:39 (in 2h 13m)`）；
+  後端在該 window 沒有待重置時間時會送 `null`，此時顯示 `no reset`。
 - `updated_at`（後端上次更新數字的時間）轉成本地時區顯示在 provider 標題（TUI）或 provider 行（`--once`）；
   沒有時 TUI 標題改顯示本機抓取時間。TUI 底部固定顯示最後一次成功抓取的本機時間（抓取失敗時也會保留）。
 
